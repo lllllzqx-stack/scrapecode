@@ -1,0 +1,13 @@
+{
+  "name": "telegram-web-code-extension",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Chrome extension that watches Telegram Web DOM for Code: messages.",
+  "scripts": {
+    "test": "node --test",
+    "webhook": "node examples/webhook-server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

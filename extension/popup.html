@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Telegram Code Watcher</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main class="panel">
+      <header class="header">
+        <h1>Code Watcher</h1>
+        <span id="count" class="count">0</span>
+      </header>
+
+      <section class="controls" aria-label="Controls">
+        <label class="toggle">
+          <input id="notificationEnabled" type="checkbox">
+          <span>Notification</span>
+        </label>
+        <label class="toggle">
+          <input id="soundEnabled" type="checkbox">
+          <span>Audio</span>
+        </label>
+        <label class="toggle">
+          <input id="webhookEnabled" type="checkbox">
+          <span>Webhook</span>
+        </label>
+      </section>
+
+      <label class="field">
+        <span>Local webhook</span>
+        <input id="webhookUrl" type="url" spellcheck="false">
+      </label>
+
+      <div class="actions">
+        <button id="save" type="button">Save</button>
+        <button id="scan" type="button">Scan</button>
+        <button id="test" type="button">Test</button>
+        <button id="clear" type="button">Clear</button>
+      </div>
+
+      <p id="status" class="status">Ready</p>
+      <ol id="history" class="history"></ol>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>
