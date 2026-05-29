@@ -7,6 +7,19 @@ const DEFAULT_SETTINGS = {
   webhookUrl: 'https://api.val.bot/api/webhooks/broadcast/content',
   webhookApiKey: '',
   webhookType: 'code_daily_hr',
+  videoCaptureEnabled: true,
+  videoFrameWebhookType: 'code_daily_hr_frames',
+  videoFrameCount: 5,
+  videoFrameStartMs: 500,
+  videoFrameEndMs: 3500,
+  videoFrameMaxHeight: 720,
+  videoFrameQuality: 0.86,
+  videoFrameMimeType: 'image/png',
+  telegramBotEnabled: false,
+  telegramBotToken: '',
+  telegramChatId: '',
+  telegramSendCode: true,
+  telegramSendFrames: true,
   historyLimit: 500,
   processedLimit: 1500
 };
@@ -35,6 +48,18 @@ async function handleMessage(message, sender) {
     return getState();
   }
 
+  if (message?.type === 'TW_GET_CAPTURE_SETTINGS') {
+    return getCaptureSettings();
+  }
+
+  if (message?.type === 'TW_VIDEO_FRAMES_CAPTURED') {
+    return handleVideoFrames(message.payload, sender);
+  }
+
+  if (message?.type === 'TW_VIDEO_FRAME_CAPTURE_FAILED') {
+    return handleVideoCaptureFailure(message.payload, sender);
+  }
+
   if (message?.type === 'TW_UPDATE_SETTINGS') {
     return updateSettings(message.settings || {});
   }
@@ -42,8 +67,10 @@ async function handleMessage(message, sender) {
   if (message?.type === 'TW_CLEAR_HISTORY') {
     await chrome.storage.local.set({
       history: [],
+      videoHistory: [],
       processedCodes: [],
-      processedFingerprints: []
+      processedFingerprints: [],
+      processedVideoFingerprints: []
     });
     await updateBadge(0);
     return { ok: true };
@@ -117,12 +144,84 @@ async function handleDetectedCode(payload, sender) {
   return { ok: true, duplicate: false, silent: Boolean(payload.silent) };
 }
 
+async function handleVideoFrames(payload, sender) {
+  const settings = await loadSettings();
+  const event = {
+    messageId: payload?.messageId || null,
+    messageUrl: payload?.messageUrl || null,
+    pageUrl: payload?.pageUrl || sender.tab?.url || null,
+    tabId: sender.tab?.id || null,
+    videoSrc: payload?.videoSrc || null,
+    fingerprint: payload?.fingerprint || `video:${Date.now()}`,
+    frames: Array.isArray(payload?.frames) ? payload.frames : [],
+    capturedAt: new Date().toISOString()
+  };
+
+  const state = await chrome.storage.local.get({
+    videoHistory: [],
+    processedVideoFingerprints: []
+  });
+  const processedVideoFingerprints = new Set(state.processedVideoFingerprints);
+
+  if (processedVideoFingerprints.has(event.fingerprint)) {
+    return { ok: true, duplicate: true };
+  }
+
+  processedVideoFingerprints.add(event.fingerprint);
+  const videoHistory = [summarizeVideoEvent(event), ...state.videoHistory].slice(0, settings.historyLimit);
+  await chrome.storage.local.set({
+    videoHistory,
+    processedVideoFingerprints: Array.from(processedVideoFingerprints).slice(-settings.processedLimit),
+    lastVideoFrames: summarizeVideoEvent(event)
+  });
+
+  const results = {
+    webhook: false,
+    telegram: false
+  };
+
+  if (settings.webhookEnabled && settings.webhookUrl) {
+    results.webhook = await sendFrameWebhook(settings.webhookUrl, event, settings);
+  }
+
+  if (hasTelegramConfig(settings) && settings.telegramSendFrames) {
+    try {
+      results.telegram = await sendTelegramFrames(event, settings);
+    } catch (error) {
+      results.telegram = { ok: false, error: error.message };
+      await chrome.storage.local.set({
+        lastTelegramFrameResult: {
+          ok: false,
+          error: error.message,
+          at: new Date().toISOString()
+        }
+      });
+    }
+  }
+
+  return { ok: true, duplicate: false, ...results };
+}
+
+async function handleVideoCaptureFailure(payload, sender) {
+  const failure = {
+    messageId: payload?.messageId || null,
+    messageUrl: payload?.messageUrl || null,
+    pageUrl: payload?.pageUrl || sender.tab?.url || null,
+    fingerprint: payload?.fingerprint || null,
+    error: payload?.error || 'Video capture failed',
+    at: new Date().toISOString()
+  };
+  await chrome.storage.local.set({ lastVideoCaptureError: failure });
+  return { ok: true };
+}
+
 async function emitAlert(event, settings) {
   const results = {
     ok: true,
     notification: false,
     sound: false,
-    webhook: false
+    webhook: false,
+    telegram: false
   };
 
   if (settings.notificationEnabled) {
@@ -154,6 +253,14 @@ async function emitAlert(event, settings) {
       results.webhook = await sendWebhook(settings.webhookUrl, event, settings);
     } catch (error) {
       results.webhook = { ok: false, error: error.message };
+    }
+  }
+
+  if (hasTelegramConfig(settings) && settings.telegramSendCode) {
+    try {
+      results.telegram = await sendTelegramMessage(event, settings);
+    } catch (error) {
+      results.telegram = { ok: false, error: error.message };
     }
   }
 
@@ -200,6 +307,173 @@ async function sendWebhook(url, event, settings) {
   }
 }
 
+async function sendFrameWebhook(url, event, settings) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
+
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        ...(settings.webhookApiKey
+          ? { 'x-internal-api-key': settings.webhookApiKey }
+          : {})
+      },
+      body: JSON.stringify({
+        type: settings.videoFrameWebhookType || 'code_daily_hr_frames',
+        content: {
+          pageUrl: event.pageUrl,
+          messageId: event.messageId,
+          messageUrl: event.messageUrl,
+          capturedAt: event.capturedAt,
+          frames: event.frames
+        }
+      }),
+      signal: controller.signal
+    });
+
+    const result = {
+      ok: response.ok,
+      status: response.status,
+      at: new Date().toISOString()
+    };
+    await chrome.storage.local.set({ lastFrameWebhookResult: result });
+    return result;
+  } catch (error) {
+    const result = {
+      ok: false,
+      error: error.message,
+      at: new Date().toISOString()
+    };
+    await chrome.storage.local.set({ lastFrameWebhookResult: result });
+    return result;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function sendTelegramMessage(event, settings) {
+  const response = await fetch(buildTelegramApiUrl(settings.telegramBotToken, 'sendMessage'), {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json'
+    },
+    body: JSON.stringify({
+      chat_id: settings.telegramChatId,
+      text: `Code: ${event.code}`,
+      disable_web_page_preview: true
+    })
+  });
+  return saveTelegramResult('lastTelegramCodeResult', response);
+}
+
+async function sendTelegramFrames(event, settings) {
+  const frames = event.frames.slice(0, 10);
+  if (frames.length === 0) {
+    return { ok: false, error: 'No frames to send' };
+  }
+
+  if (frames.length === 1) {
+    return sendTelegramDocument(frames[0], event, settings);
+  }
+
+  const form = new FormData();
+  form.append('chat_id', settings.telegramChatId);
+  form.append('media', JSON.stringify(frames.map((frame, index) => ({
+    type: 'document',
+    media: `attach://frame_${index}`,
+    caption: index === 0 ? buildFrameCaption(event) : undefined,
+    disable_content_type_detection: true
+  }))));
+
+  frames.forEach((frame, index) => {
+    form.append(`frame_${index}`, dataUrlToBlob(frame.dataUrl), buildFrameFilename(frame, index));
+  });
+
+  const response = await fetch(buildTelegramApiUrl(settings.telegramBotToken, 'sendMediaGroup'), {
+    method: 'POST',
+    body: form
+  });
+  return saveTelegramResult('lastTelegramFrameResult', response);
+}
+
+async function sendTelegramDocument(frame, event, settings) {
+  const form = new FormData();
+  form.append('chat_id', settings.telegramChatId);
+  form.append('caption', buildFrameCaption(event));
+  form.append('disable_content_type_detection', 'true');
+  form.append('document', dataUrlToBlob(frame.dataUrl), buildFrameFilename(frame, 0));
+
+  const response = await fetch(buildTelegramApiUrl(settings.telegramBotToken, 'sendDocument'), {
+    method: 'POST',
+    body: form
+  });
+  return saveTelegramResult('lastTelegramFrameResult', response);
+}
+
+async function saveTelegramResult(storageKey, response) {
+  const result = {
+    ok: response.ok,
+    status: response.status,
+    at: new Date().toISOString()
+  };
+
+  try {
+    const body = await response.json();
+    if (!response.ok && body?.description) {
+      result.error = body.description;
+    }
+  } catch (error) {
+    if (!response.ok) {
+      result.error = response.statusText;
+    }
+  }
+
+  await chrome.storage.local.set({ [storageKey]: result });
+  return result;
+}
+
+function hasTelegramConfig(settings) {
+  return Boolean(settings.telegramBotEnabled && settings.telegramBotToken && settings.telegramChatId);
+}
+
+function buildTelegramApiUrl(token, method) {
+  return `https://api.telegram.org/bot${String(token).trim()}/${method}`;
+}
+
+function buildFrameCaption(event) {
+  const parts = ['Stake frame capture'];
+  if (event.messageId) {
+    parts.push(`message: ${event.messageId}`);
+  }
+  if (event.messageUrl) {
+    parts.push(event.messageUrl);
+  }
+  return parts.join('\n');
+}
+
+function buildFrameFilename(frame, index) {
+  const extension = frame.mimeType === 'image/png' ? 'png' : 'jpg';
+  return `stake-frame-${String(index + 1).padStart(2, '0')}-${frame.timeMs}ms.${extension}`;
+}
+
+function dataUrlToBlob(dataUrl) {
+  const match = String(dataUrl || '').match(/^data:([^;,]+);base64,(.+)$/);
+  if (!match) {
+    throw new Error('Invalid frame data URL');
+  }
+
+  const mimeType = match[1];
+  const binary = atob(match[2]);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+
+  return new Blob([bytes], { type: mimeType });
+}
+
 async function playSound() {
   if (!chrome.offscreen) {
     return;
@@ -222,16 +496,42 @@ async function getState() {
   const state = await chrome.storage.local.get({
     settings: defaults,
     history: [],
+    videoHistory: [],
     lastDetected: null,
-    lastWebhookResult: null
+    lastWebhookResult: null,
+    lastFrameWebhookResult: null,
+    lastVideoCaptureError: null,
+    lastTelegramCodeResult: null,
+    lastTelegramFrameResult: null
   });
 
   return {
     ok: true,
     settings: { ...DEFAULT_SETTINGS, ...(state.settings || {}), ...defaults },
     history: state.history,
+    videoHistory: state.videoHistory,
     lastDetected: state.lastDetected,
-    lastWebhookResult: state.lastWebhookResult
+    lastWebhookResult: state.lastWebhookResult,
+    lastFrameWebhookResult: state.lastFrameWebhookResult,
+    lastVideoCaptureError: state.lastVideoCaptureError,
+    lastTelegramCodeResult: state.lastTelegramCodeResult,
+    lastTelegramFrameResult: state.lastTelegramFrameResult
+  };
+}
+
+async function getCaptureSettings() {
+  const settings = await loadSettings();
+  return {
+    ok: true,
+    settings: {
+      videoCaptureEnabled: Boolean(settings.videoCaptureEnabled),
+      videoFrameCount: clampNumber(settings.videoFrameCount, 1, 8),
+      videoFrameStartMs: clampNumber(settings.videoFrameStartMs, 0, 60_000),
+      videoFrameEndMs: clampNumber(settings.videoFrameEndMs, 0, 60_000),
+      videoFrameMaxHeight: clampNumber(settings.videoFrameMaxHeight, 180, 1080),
+      videoFrameQuality: clampFloat(settings.videoFrameQuality, 0.35, 0.95),
+      videoFrameMimeType: normalizeFrameMimeType(settings.videoFrameMimeType)
+    }
   };
 }
 
@@ -284,6 +584,19 @@ function sanitizeConfig(config) {
     'webhookUrl',
     'webhookApiKey',
     'webhookType',
+    'videoCaptureEnabled',
+    'videoFrameWebhookType',
+    'videoFrameCount',
+    'videoFrameStartMs',
+    'videoFrameEndMs',
+    'videoFrameMaxHeight',
+    'videoFrameQuality',
+    'videoFrameMimeType',
+    'telegramBotEnabled',
+    'telegramBotToken',
+    'telegramChatId',
+    'telegramSendCode',
+    'telegramSendFrames',
     'historyLimit',
     'processedLimit'
   ];
@@ -311,6 +624,29 @@ function clampNumber(value, min, max) {
     return min;
   }
   return Math.min(Math.max(number, min), max);
+}
+
+function clampFloat(value, min, max) {
+  const number = Number.parseFloat(value);
+  if (!Number.isFinite(number)) {
+    return min;
+  }
+  return Math.min(Math.max(number, min), max);
+}
+
+function normalizeFrameMimeType(value) {
+  return value === 'image/jpeg' ? 'image/jpeg' : 'image/png';
+}
+
+function summarizeVideoEvent(event) {
+  return {
+    messageId: event.messageId,
+    messageUrl: event.messageUrl,
+    pageUrl: event.pageUrl,
+    fingerprint: event.fingerprint,
+    frameCount: event.frames.length,
+    capturedAt: event.capturedAt
+  };
 }
 
 function hashString(value) {
