@@ -21,33 +21,39 @@ Kalau match dan belum pernah diproses, extension akan:
 4. Pilih folder `extension`.
 5. Buka `https://web.telegram.org` dan masuk ke channel target.
 
-## Local Webhook
+## Config Lokal
 
-Default webhook:
+Setting bisa diubah dari popup extension atau dari file lokal `extension/config.json`. File itu masuk `.gitignore`, jadi aman buat isi API key sendiri. Nilai di `config.json` akan jadi override; string kosong tidak dihitung sebagai override.
 
-```text
-http://127.0.0.1:8787/code
+Contoh:
+
+```json
+{
+  "webhookEnabled": true,
+  "webhookUrl": "https://api.val.bot/api/webhooks/broadcast/content",
+  "webhookApiKey": "ISI_SENDIRI",
+  "webhookType": "code_daily_hr",
+  "notificationEnabled": true,
+  "soundEnabled": true
+}
 ```
 
-Jalankan contoh receiver:
+Kalau ubah `extension/config.json`, reload extension dari `chrome://extensions` / `edge://extensions`.
+
+## Local Webhook Test
+
+Jalankan contoh receiver lokal kalau mau tes tanpa ValBot:
 
 ```bash
 npm run webhook
 ```
 
-Payload yang dikirim:
+Payload ValBot yang dikirim:
 
 ```json
 {
-  "source": "telegram-web-code-watcher",
-  "code": "stakecomD6nrMahwmZGN",
-  "rawLine": "Code: stakecomD6nrMahwmZGN",
-  "text": "...",
-  "messageId": "...",
-  "messageUrl": "...",
-  "pageUrl": "https://web.telegram.org/...",
-  "fingerprint": "...",
-  "detectedAt": "2026-05-25T10:00:00.000Z"
+  "type": "code_daily_hr",
+  "content": "stakecomD6nrMahwmZGN"
 }
 ```
 

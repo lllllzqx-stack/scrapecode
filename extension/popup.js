@@ -5,6 +5,8 @@ const elements = {
   soundEnabled: document.querySelector('#soundEnabled'),
   webhookEnabled: document.querySelector('#webhookEnabled'),
   webhookUrl: document.querySelector('#webhookUrl'),
+  webhookApiKey: document.querySelector('#webhookApiKey'),
+  webhookType: document.querySelector('#webhookType'),
   count: document.querySelector('#count'),
   status: document.querySelector('#status'),
   history: document.querySelector('#history'),
@@ -32,6 +34,8 @@ async function refresh() {
   elements.soundEnabled.checked = Boolean(settings.soundEnabled);
   elements.webhookEnabled.checked = Boolean(settings.webhookEnabled);
   elements.webhookUrl.value = settings.webhookUrl || '';
+  elements.webhookApiKey.value = settings.webhookApiKey || '';
+  elements.webhookType.value = settings.webhookType || '';
   elements.count.textContent = String(history.length);
   renderHistory(history);
 
@@ -49,7 +53,9 @@ async function saveSettings() {
       notificationEnabled: elements.notificationEnabled.checked,
       soundEnabled: elements.soundEnabled.checked,
       webhookEnabled: elements.webhookEnabled.checked,
-      webhookUrl: elements.webhookUrl.value.trim()
+      webhookUrl: elements.webhookUrl.value.trim(),
+      webhookApiKey: elements.webhookApiKey.value,
+      webhookType: elements.webhookType.value.trim()
     }
   });
 

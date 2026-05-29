@@ -1,0 +1,8 @@
+{
+  "webhookEnabled": true,
+  "webhookUrl": "https://api.val.bot/api/webhooks/broadcast/content",
+  "webhookApiKey": "PUT_YOUR_KEY_HERE",
+  "webhookType": "code_daily_hr",
+  "notificationEnabled": true,
+  "soundEnabled": true
+}

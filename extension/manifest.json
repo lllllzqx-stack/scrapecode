@@ -11,6 +11,7 @@
   ],
   "host_permissions": [
     "https://web.telegram.org/*",
+    "https://api.val.bot/*",
     "http://127.0.0.1/*",
     "http://localhost/*"
   ],

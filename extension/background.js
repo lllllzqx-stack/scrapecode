@@ -4,15 +4,18 @@ const DEFAULT_SETTINGS = {
   notificationEnabled: true,
   soundEnabled: true,
   webhookEnabled: true,
-  webhookUrl: 'http://127.0.0.1:8787/code',
+  webhookUrl: 'https://api.val.bot/api/webhooks/broadcast/content',
+  webhookApiKey: '',
+  webhookType: 'code_daily_hr',
   historyLimit: 500,
   processedLimit: 1500
 };
 
 chrome.runtime.onInstalled.addListener(async () => {
+  const defaults = await loadDefaultSettings();
   const { settings } = await chrome.storage.local.get('settings');
   if (!settings) {
-    await chrome.storage.local.set({ settings: DEFAULT_SETTINGS });
+    await chrome.storage.local.set({ settings: defaults });
   }
 });
 
@@ -148,7 +151,7 @@ async function emitAlert(event, settings) {
 
   if (settings.webhookEnabled && settings.webhookUrl) {
     try {
-      results.webhook = await sendWebhook(settings.webhookUrl, event);
+      results.webhook = await sendWebhook(settings.webhookUrl, event, settings);
     } catch (error) {
       results.webhook = { ok: false, error: error.message };
     }
@@ -157,7 +160,7 @@ async function emitAlert(event, settings) {
   return results;
 }
 
-async function sendWebhook(url, event) {
+async function sendWebhook(url, event, settings) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 5000);
 
@@ -165,11 +168,14 @@ async function sendWebhook(url, event) {
     const response = await fetch(url, {
       method: 'POST',
       headers: {
-        'content-type': 'application/json'
+        'content-type': 'application/json',
+        ...(settings.webhookApiKey
+          ? { 'x-internal-api-key': settings.webhookApiKey }
+          : {})
       },
       body: JSON.stringify({
-        source: 'telegram-web-code-watcher',
-        ...event
+        type: settings.webhookType || 'code_daily_hr',
+        content: event.code
       }),
       signal: controller.signal
     });
@@ -212,8 +218,9 @@ async function playSound() {
 }
 
 async function getState() {
+  const defaults = await loadDefaultSettings();
   const state = await chrome.storage.local.get({
-    settings: DEFAULT_SETTINGS,
+    settings: defaults,
     history: [],
     lastDetected: null,
     lastWebhookResult: null
@@ -221,7 +228,7 @@ async function getState() {
 
   return {
     ok: true,
-    settings: { ...DEFAULT_SETTINGS, ...state.settings },
+    settings: { ...DEFAULT_SETTINGS, ...(state.settings || {}), ...defaults },
     history: state.history,
     lastDetected: state.lastDetected,
     lastWebhookResult: state.lastWebhookResult
@@ -229,9 +236,11 @@ async function getState() {
 }
 
 async function updateSettings(nextSettings) {
+  const defaults = await loadDefaultSettings();
   const settings = {
     ...DEFAULT_SETTINGS,
     ...(await loadSettings()),
+    ...defaults,
     ...nextSettings
   };
 
@@ -243,8 +252,51 @@ async function updateSettings(nextSettings) {
 }
 
 async function loadSettings() {
+  const defaults = await loadDefaultSettings();
   const { settings } = await chrome.storage.local.get('settings');
-  return { ...DEFAULT_SETTINGS, ...(settings || {}) };
+  return { ...DEFAULT_SETTINGS, ...(settings || {}), ...defaults };
+}
+
+async function loadDefaultSettings() {
+  const fileSettings = await loadConfigFile();
+  return { ...DEFAULT_SETTINGS, ...fileSettings };
+}
+
+async function loadConfigFile() {
+  try {
+    const response = await fetch(chrome.runtime.getURL('config.json'), { cache: 'no-store' });
+    if (!response.ok) {
+      return {};
+    }
+
+    const config = await response.json();
+    return sanitizeConfig(config);
+  } catch (error) {
+    return {};
+  }
+}
+
+function sanitizeConfig(config) {
+  const allowedKeys = [
+    'notificationEnabled',
+    'soundEnabled',
+    'webhookEnabled',
+    'webhookUrl',
+    'webhookApiKey',
+    'webhookType',
+    'historyLimit',
+    'processedLimit'
+  ];
+
+  return Object.fromEntries(
+    Object.entries(config || {}).filter(([key, value]) => {
+      if (!allowedKeys.includes(key)) {
+        return false;
+      }
+
+      return typeof value !== 'string' || value.trim() !== '';
+    })
+  );
 }
 
 async function updateBadge(count) {
