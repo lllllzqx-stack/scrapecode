@@ -18,8 +18,14 @@
   const nodeHashes = new WeakMap();
   const videoCaptureStarted = new WeakSet();
   const videoFingerprints = new Set();
-  const pendingRoots = new Set();
-  const bootstrapSilentUntil = Date.now() + 2500;
+  const pendingScans = new Map();
+  const startupStartedAt = Date.now();
+  const STARTUP_MIN_MS = 2500;
+  const STARTUP_IDLE_MS = 1200;
+  const STARTUP_MAX_MS = 10000;
+  let liveMode = false;
+  let startupTimer = null;
+  let maxSeenMessageNumber = 0;
   let captureSettings = null;
   let captureSettingsLoadedAt = 0;
   let flushTimer = null;
@@ -30,18 +36,23 @@
       return;
     }
 
-    queueScan(document.body);
+    queueScan(document.body, { silent: true });
+    scheduleLiveMode();
 
     const observer = new MutationObserver((mutations) => {
+      if (!liveMode) {
+        scheduleLiveMode();
+      }
+
       for (const mutation of mutations) {
         if (mutation.type === 'childList') {
           for (const node of mutation.addedNodes) {
-            queueScan(node);
+            queueScan(node, { silent: !liveMode });
           }
         } else if (mutation.type === 'characterData') {
-          queueScan(mutation.target.parentElement);
+          queueScan(mutation.target.parentElement, { silent: !liveMode });
         } else if (mutation.type === 'attributes') {
-          queueScan(mutation.target);
+          queueScan(mutation.target, { silent: !liveMode });
         }
       }
     });
@@ -55,32 +66,65 @@
 
     chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       if (message?.type === 'TW_CODE_WATCHER_SCAN_NOW') {
-        scanRoot(document.body, { force: true, silent: false });
+        scanRoot(document.body, { force: true, silent: true });
         sendResponse({ ok: true });
       }
       return false;
     });
   }
 
-  function queueScan(root) {
+  function queueScan(root, options = {}) {
     if (!root) {
       return;
     }
 
-    pendingRoots.add(root);
+    const previous = pendingScans.get(root) || {};
+    pendingScans.set(root, {
+      force: Boolean(previous.force || options.force),
+      silent: Boolean(previous.silent || options.silent)
+    });
+
     if (flushTimer) {
       return;
     }
 
     flushTimer = window.setTimeout(() => {
-      const roots = Array.from(pendingRoots);
-      pendingRoots.clear();
+      const scans = Array.from(pendingScans.entries());
+      pendingScans.clear();
       flushTimer = null;
 
-      for (const root of roots) {
-        scanRoot(root, { silent: Date.now() < bootstrapSilentUntil });
+      for (const [root, scanOptions] of scans) {
+        scanRoot(root, scanOptions);
       }
     }, 150);
+  }
+
+  function scheduleLiveMode() {
+    if (liveMode) {
+      return;
+    }
+
+    window.clearTimeout(startupTimer);
+    const elapsedMs = Date.now() - startupStartedAt;
+    if (elapsedMs >= STARTUP_MAX_MS) {
+      activateLiveMode();
+      return;
+    }
+
+    const waitMs = Math.min(
+      Math.max(STARTUP_IDLE_MS, STARTUP_MIN_MS - elapsedMs),
+      STARTUP_MAX_MS - elapsedMs
+    );
+    startupTimer = window.setTimeout(activateLiveMode, waitMs);
+  }
+
+  function activateLiveMode() {
+    if (liveMode) {
+      return;
+    }
+
+    scanRoot(document.body, { silent: true });
+    liveMode = true;
   }
 
   function scanRoot(root, options = {}) {
@@ -148,6 +192,8 @@
 
     const messageId = findMessageId(element);
     const messageUrl = findMessageUrl(element);
+    const messageNumber = getMessageNumber(messageId, messageUrl);
+    const shouldForceSilent = Boolean(options.silent || !liveMode || isOldMessageNumber(messageNumber));
 
     for (const match of matches) {
       const codeKey = match.code.toLowerCase();
@@ -161,6 +207,7 @@
       }
 
       runtimeSeen.add(fingerprint);
+      rememberMessageNumber(messageNumber);
       chrome.runtime.sendMessage({
         type: 'TW_CODE_DETECTED',
         payload: {
@@ -171,7 +218,7 @@
           messageUrl,
           pageUrl: location.href,
           fingerprint,
-          silent: Boolean(options.silent)
+          silent: shouldForceSilent
         }
       });
     }
@@ -179,6 +226,7 @@
 
   async function scanVideos(root, options = {}) {
     if (options.silent || !root) {
+      seedVideoMessageNumbers(root);
       return;
     }
 
@@ -192,9 +240,16 @@
         continue;
       }
 
+      const container = findMessageContainer(video);
+      const messageNumber = getMessageNumber(findMessageId(container), findMessageUrl(container));
+      if (isOldMessageNumber(messageNumber)) {
+        videoCaptureStarted.add(video);
+        continue;
+      }
+
+      rememberMessageNumber(messageNumber);
       videoCaptureStarted.add(video);
       captureVideoFrames(video, settings).catch((error) => {
-        const container = findMessageContainer(video);
         chrome.runtime.sendMessage({
           type: 'TW_VIDEO_FRAME_CAPTURE_FAILED',
           payload: {
@@ -228,6 +283,13 @@
     }
 
     return Array.from(videos);
+  }
+
+  function seedVideoMessageNumbers(root) {
+    for (const video of collectVideos(root)) {
+      const container = findMessageContainer(video);
+      rememberMessageNumber(getMessageNumber(findMessageId(container), findMessageUrl(container)));
+    }
   }
 
   async function captureVideoFrames(video, settings) {
@@ -463,6 +525,35 @@
     const container = findMessageContainer(element);
     const link = container.querySelector?.('a[href*="t.me/"], a[href*="web.telegram.org/"]');
     return link?.href || null;
+  }
+
+  function getMessageNumber(...values) {
+    for (const value of values) {
+      const text = String(value || '');
+      const matches = text.match(/\d+/g);
+      if (!matches) {
+        continue;
+      }
+
+      const number = Number.parseInt(matches[matches.length - 1], 10);
+      if (Number.isFinite(number)) {
+        return number;
+      }
+    }
+
+    return null;
+  }
+
+  function isOldMessageNumber(messageNumber) {
+    return Number.isFinite(messageNumber)
+      && maxSeenMessageNumber > 0
+      && messageNumber <= maxSeenMessageNumber;
+  }
+
+  function rememberMessageNumber(messageNumber) {
+    if (Number.isFinite(messageNumber)) {
+      maxSeenMessageNumber = Math.max(maxSeenMessageNumber, messageNumber);
+    }
   }
 
   start();
