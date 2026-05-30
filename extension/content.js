@@ -20,12 +20,15 @@
   const videoFingerprints = new Set();
   const pendingScans = new Map();
   const startupStartedAt = Date.now();
-  const STARTUP_MIN_MS = 2500;
-  const STARTUP_IDLE_MS = 1200;
-  const STARTUP_MAX_MS = 10000;
+  const STARTUP_MIN_MS = 8000;
+  const STARTUP_IDLE_MS = 3000;
+  const STARTUP_MAX_MS = 30000;
+  const processedCodeCache = new Set();
   let liveMode = false;
+  let activatingLiveMode = false;
   let startupTimer = null;
   let maxSeenMessageNumber = 0;
+  let maxSeenTimelineMs = 0;
   let captureSettings = null;
   let captureSettingsLoadedAt = 0;
   let flushTimer = null;
@@ -36,6 +39,12 @@
       return;
     }
 
+    sendRuntimeMessage({
+      type: 'TW_SCAN_STARTED',
+      payload: {
+        pageUrl: location.href
+      }
+    });
     queueScan(document.body, { silent: true });
     scheduleLiveMode();
 
@@ -119,20 +128,38 @@
   }
 
   function activateLiveMode() {
-    if (liveMode) {
+    if (liveMode || activatingLiveMode) {
       return;
     }
 
-    scanRoot(document.body, { silent: true });
-    liveMode = true;
+    activatingLiveMode = true;
+    Promise.all([
+      scanTextElements(document.body, { force: true, silent: true }),
+      scanVideos(document.body, { silent: true })
+    ]).finally(() => {
+      liveMode = true;
+      activatingLiveMode = false;
+      sendRuntimeMessage({
+        type: 'TW_SCAN_READY',
+        payload: {
+          pageUrl: location.href,
+          maxSeenMessageNumber,
+          maxSeenTimelineMs
+        }
+      });
+    });
   }
 
   function scanRoot(root, options = {}) {
-    for (const element of collectCandidateElements(root)) {
-      scanElement(element, options);
-    }
+    scanTextElements(root, options).catch(() => {});
 
     scanVideos(root, options).catch(() => {});
+  }
+
+  async function scanTextElements(root, options = {}) {
+    for (const element of collectCandidateElements(root)) {
+      await scanElement(element, options);
+    }
   }
 
   function collectCandidateElements(root) {
@@ -173,7 +200,7 @@
     return Array.from(elements).filter(Boolean);
   }
 
-  function scanElement(element, options = {}) {
+  async function scanElement(element, options = {}) {
     if (!element?.textContent || !/Code\s*:/i.test(element.textContent)) {
       return;
     }
@@ -193,7 +220,14 @@
     const messageId = findMessageId(element);
     const messageUrl = findMessageUrl(element);
     const messageNumber = getMessageNumber(messageId, messageUrl);
-    const shouldForceSilent = Boolean(options.silent || !liveMode || isOldMessageNumber(messageNumber));
+    const timelineMs = getMessageTimelineMs(element);
+    const shouldForceSilent = Boolean(
+      options.silent
+      || !liveMode
+      || isOldMessageNumber(messageNumber)
+      || isOldTimeline(timelineMs, messageNumber)
+    );
+    const processedStatus = await getProcessedStatus(matches.map((match) => match.code));
 
     for (const match of matches) {
       const codeKey = match.code.toLowerCase();
@@ -208,6 +242,12 @@
 
       runtimeSeen.add(fingerprint);
       rememberMessageNumber(messageNumber);
+      rememberTimeline(timelineMs);
+      if (processedStatus[codeKey]) {
+        continue;
+      }
+
+      rememberProcessedCode(match.code);
       chrome.runtime.sendMessage({
         type: 'TW_CODE_DETECTED',
         payload: {
@@ -218,6 +258,8 @@
           messageUrl,
           pageUrl: location.href,
           fingerprint,
+          messageNumber,
+          timelineMs,
           silent: shouldForceSilent
         }
       });
@@ -242,12 +284,14 @@
 
       const container = findMessageContainer(video);
       const messageNumber = getMessageNumber(findMessageId(container), findMessageUrl(container));
-      if (isOldMessageNumber(messageNumber)) {
+      const timelineMs = getMessageTimelineMs(container);
+      if (isOldMessageNumber(messageNumber) || isOldTimeline(timelineMs, messageNumber)) {
         videoCaptureStarted.add(video);
         continue;
       }
 
       rememberMessageNumber(messageNumber);
+      rememberTimeline(timelineMs);
       videoCaptureStarted.add(video);
       captureVideoFrames(video, settings).catch((error) => {
         chrome.runtime.sendMessage({
@@ -289,6 +333,7 @@
     for (const video of collectVideos(root)) {
       const container = findMessageContainer(video);
       rememberMessageNumber(getMessageNumber(findMessageId(container), findMessageUrl(container)));
+      rememberTimeline(getMessageTimelineMs(container));
     }
   }
 
@@ -397,6 +442,37 @@
     captureSettings = response?.settings || { videoCaptureEnabled: false };
     captureSettingsLoadedAt = Date.now();
     return captureSettings;
+  }
+
+  async function getProcessedStatus(codes) {
+    const uniqueCodes = Array.from(new Set(codes.map((code) => String(code || '').toLowerCase())));
+    const uncachedCodes = uniqueCodes.filter((code) => !processedCodeCache.has(code));
+    const result = Object.fromEntries(uniqueCodes.map((code) => [code, processedCodeCache.has(code)]));
+
+    if (uncachedCodes.length === 0) {
+      return result;
+    }
+
+    const response = await sendRuntimeMessage({
+      type: 'TW_ARE_CODES_PROCESSED',
+      codes: uncachedCodes
+    });
+
+    for (const [code, processed] of Object.entries(response?.processed || {})) {
+      if (processed) {
+        processedCodeCache.add(code);
+        result[code] = true;
+      }
+    }
+
+    return result;
+  }
+
+  function rememberProcessedCode(code) {
+    const codeKey = String(code || '').toLowerCase();
+    if (codeKey) {
+      processedCodeCache.add(codeKey);
+    }
   }
 
   function sendRuntimeMessage(message) {
@@ -527,6 +603,87 @@
     return link?.href || null;
   }
 
+  function getMessageTimelineMs(element) {
+    const container = findMessageContainer(element);
+    const candidates = [
+      container,
+      ...Array.from(container.querySelectorAll?.(
+        'time, [datetime], [data-timestamp], [data-time], [data-date], [title], [aria-label], [class*="time"], [class*="Time"], [class*="date"], [class*="Date"]'
+      ) || [])
+    ].slice(0, 40);
+
+    for (const candidate of candidates) {
+      const values = [
+        candidate.getAttribute?.('datetime'),
+        candidate.getAttribute?.('data-timestamp'),
+        candidate.getAttribute?.('data-time'),
+        candidate.getAttribute?.('data-date'),
+        candidate.getAttribute?.('title'),
+        candidate.getAttribute?.('aria-label'),
+        candidate.tagName?.toLowerCase() === 'time' ? candidate.textContent : null
+      ];
+
+      for (const value of values) {
+        const timelineMs = parseTimelineValue(value);
+        if (Number.isFinite(timelineMs)) {
+          return timelineMs;
+        }
+      }
+    }
+
+    return null;
+  }
+
+  function parseTimelineValue(value) {
+    const text = String(value || '').trim();
+    if (!text) {
+      return null;
+    }
+
+    if (/^\d{13}$/.test(text)) {
+      return normalizeTimelineMs(Number.parseInt(text, 10));
+    }
+
+    if (/^\d{10}$/.test(text)) {
+      return normalizeTimelineMs(Number.parseInt(text, 10) * 1000);
+    }
+
+    const parsed = Date.parse(text);
+    if (Number.isFinite(parsed)) {
+      return normalizeTimelineMs(parsed);
+    }
+
+    const timeMatch = text.match(/\b(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)?\b/i);
+    if (!timeMatch) {
+      return null;
+    }
+
+    let hour = Number.parseInt(timeMatch[1], 10);
+    const minute = Number.parseInt(timeMatch[2], 10);
+    const second = Number.parseInt(timeMatch[3] || '0', 10);
+    const meridiem = timeMatch[4]?.toUpperCase();
+
+    if (meridiem === 'PM' && hour < 12) {
+      hour += 12;
+    } else if (meridiem === 'AM' && hour === 12) {
+      hour = 0;
+    }
+
+    if (hour > 23 || minute > 59 || second > 59) {
+      return null;
+    }
+
+    const today = new Date();
+    today.setHours(hour, minute, second, 0);
+    return normalizeTimelineMs(today.getTime());
+  }
+
+  function normalizeTimelineMs(value) {
+    const earliest = Date.UTC(2020, 0, 1);
+    const latest = Date.now() + 86_400_000;
+    return Number.isFinite(value) && value >= earliest && value <= latest ? value : null;
+  }
+
   function getMessageNumber(...values) {
     for (const value of values) {
       const text = String(value || '');
@@ -553,6 +710,24 @@
   function rememberMessageNumber(messageNumber) {
     if (Number.isFinite(messageNumber)) {
       maxSeenMessageNumber = Math.max(maxSeenMessageNumber, messageNumber);
+    }
+  }
+
+  function isOldTimeline(timelineMs, messageNumber) {
+    if (!Number.isFinite(timelineMs) || maxSeenTimelineMs <= 0) {
+      return false;
+    }
+
+    if (Number.isFinite(messageNumber) && !isOldMessageNumber(messageNumber)) {
+      return false;
+    }
+
+    return timelineMs <= maxSeenTimelineMs;
+  }
+
+  function rememberTimeline(timelineMs) {
+    if (Number.isFinite(timelineMs)) {
+      maxSeenTimelineMs = Math.max(maxSeenTimelineMs, timelineMs);
     }
   }
 

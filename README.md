@@ -47,12 +47,16 @@ Contoh:
   "telegramChatId": "ISI_CHAT_ID",
   "telegramSendCode": true,
   "telegramSendFrames": true,
+  "maxLiveCodesPerBurst": 1,
+  "liveCodeBurstMs": 2500,
+  "autoDisarmOnScan": true,
+  "scanReadyNotification": true,
   "notificationEnabled": true,
   "soundEnabled": true
 }
 ```
 
-Kalau ubah `extension/config.json`, reload extension dari `chrome://extensions` / `edge://extensions`.
+Kalau ubah `extension/config.json`, reload extension dari `chrome://extensions` / `edge://extensions`. Dengan `autoDisarmOnScan: true`, setiap refresh/tab load akan disarm dulu, scan kode lama secara silent, lalu kasih notifikasi scan ready. Setelah itu klik `Arm` di popup supaya endpoint/Telegram hanya aktif untuk kode berikutnya.
 
 Telegram Bot API tidak bisa kirim ke nomor HP langsung. Isi `telegramChatId` dengan chat id user/group/channel tujuan. Cara paling gampang: chat bot kamu dulu, lalu buka `https://api.telegram.org/bot<BOT_TOKEN>/getUpdates` untuk lihat `message.chat.id`.
 

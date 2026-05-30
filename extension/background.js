@@ -20,9 +20,16 @@ const DEFAULT_SETTINGS = {
   telegramChatId: '',
   telegramSendCode: true,
   telegramSendFrames: true,
+  maxLiveCodesPerBurst: 1,
+  liveCodeBurstMs: 2500,
+  autoDisarmOnScan: true,
+  scanReadyNotification: true,
   historyLimit: 500,
   processedLimit: 1500
 };
+
+const pendingLiveCodeEvents = new Map();
+let pendingLiveCodeTimer = null;
 
 chrome.runtime.onInstalled.addListener(async () => {
   const defaults = await loadDefaultSettings();
@@ -50,6 +57,22 @@ async function handleMessage(message, sender) {
 
   if (message?.type === 'TW_GET_CAPTURE_SETTINGS') {
     return getCaptureSettings();
+  }
+
+  if (message?.type === 'TW_ARE_CODES_PROCESSED') {
+    return areCodesProcessed(message.codes || []);
+  }
+
+  if (message?.type === 'TW_SCAN_STARTED') {
+    return handleScanStarted(message.payload || {}, sender);
+  }
+
+  if (message?.type === 'TW_SCAN_READY') {
+    return handleScanReady(message.payload || {}, sender);
+  }
+
+  if (message?.type === 'TW_SET_DELIVERY_ARMED') {
+    return setDeliveryArmed(Boolean(message.armed));
   }
 
   if (message?.type === 'TW_VIDEO_FRAMES_CAPTURED') {
@@ -104,6 +127,8 @@ async function handleDetectedCode(payload, sender) {
     pageUrl: payload.pageUrl || sender.tab?.url || null,
     tabId: sender.tab?.id || null,
     fingerprint: payload.fingerprint || `${payload.code}:${now}`,
+    messageNumber: payload.messageNumber || null,
+    timelineMs: payload.timelineMs || null,
     detectedAt: now
   };
 
@@ -124,28 +149,164 @@ async function handleDetectedCode(payload, sender) {
   processedCodes.add(codeKey);
   processedFingerprints.add(event.fingerprint);
 
-  const history = payload.silent
-    ? state.history
-    : [event, ...state.history].slice(0, settings.historyLimit);
-
   await chrome.storage.local.set({
-    history,
+    history: state.history,
     processedCodes: Array.from(processedCodes).slice(-settings.processedLimit),
     processedFingerprints: Array.from(processedFingerprints).slice(-settings.processedLimit),
     lastDetected: event
   });
 
-  await updateBadge(history.length);
-
   if (!payload.silent) {
-    await emitAlert(event, settings);
+    queueLiveCodeEvent(event, settings);
   }
 
-  return { ok: true, duplicate: false, silent: Boolean(payload.silent) };
+  return { ok: true, duplicate: false, queued: !payload.silent, silent: Boolean(payload.silent) };
+}
+
+async function handleScanStarted(payload, sender) {
+  const settings = await loadSettings();
+  const state = {
+    status: 'scanning',
+    pageUrl: payload.pageUrl || sender.tab?.url || null,
+    startedAt: new Date().toISOString()
+  };
+  const nextStorage = { monitorStatus: state };
+
+  pendingLiveCodeEvents.clear();
+  if (pendingLiveCodeTimer) {
+    clearTimeout(pendingLiveCodeTimer);
+    pendingLiveCodeTimer = null;
+  }
+
+  if (settings.autoDisarmOnScan) {
+    nextStorage.deliveryArmed = false;
+  }
+
+  await chrome.storage.local.set(nextStorage);
+  await updateBadge(0);
+  return { ok: true, deliveryArmed: !settings.autoDisarmOnScan };
+}
+
+async function handleScanReady(payload, sender) {
+  const settings = await loadSettings();
+  const state = {
+    status: 'ready',
+    pageUrl: payload.pageUrl || sender.tab?.url || null,
+    maxSeenMessageNumber: payload.maxSeenMessageNumber || null,
+    maxSeenTimelineMs: payload.maxSeenTimelineMs || null,
+    readyAt: new Date().toISOString()
+  };
+
+  await chrome.storage.local.set({
+    monitorStatus: state,
+    deliveryArmed: false
+  });
+  await updateBadge(0);
+
+  if (settings.scanReadyNotification) {
+    await chrome.notifications.create(`telegram-scan-ready-${Date.now()}`, {
+      type: 'basic',
+      iconUrl: 'icons/icon-128.svg',
+      title: 'Telegram scan ready',
+      message: 'Old codes are seeded. Arm endpoint for the next new code.',
+      priority: 1
+    }).catch(() => {});
+  }
+
+  return { ok: true, deliveryArmed: false };
+}
+
+async function setDeliveryArmed(armed) {
+  await chrome.storage.local.set({
+    deliveryArmed: armed,
+    deliveryArmedAt: armed ? new Date().toISOString() : null
+  });
+  return { ok: true, deliveryArmed: armed };
+}
+
+function queueLiveCodeEvent(event, settings) {
+  pendingLiveCodeEvents.set(event.fingerprint, event);
+  if (pendingLiveCodeTimer) {
+    return;
+  }
+
+  pendingLiveCodeTimer = setTimeout(() => {
+    flushLiveCodeEvents().catch((error) => {
+      chrome.storage.local.set({
+        lastCodeBurstError: {
+          ok: false,
+          error: error.message,
+          at: new Date().toISOString()
+        }
+      });
+    });
+  }, clampNumber(settings.liveCodeBurstMs, 500, 10_000));
+}
+
+async function flushLiveCodeEvents() {
+  const events = Array.from(pendingLiveCodeEvents.values());
+  pendingLiveCodeEvents.clear();
+  pendingLiveCodeTimer = null;
+
+  if (events.length === 0) {
+    return;
+  }
+
+  const settings = await loadSettings();
+  const { deliveryArmed } = await chrome.storage.local.get({
+    deliveryArmed: false
+  });
+  const selectedEvents = events
+    .sort(compareNewestEvents)
+    .slice(0, clampNumber(settings.maxLiveCodesPerBurst, 1, 5));
+  const state = await chrome.storage.local.get({
+    history: []
+  });
+  const history = deliveryArmed
+    ? [...selectedEvents, ...state.history].slice(0, settings.historyLimit)
+    : state.history;
+
+  await chrome.storage.local.set({
+    history,
+    lastCodeBurst: {
+      received: events.length,
+      sent: deliveryArmed ? selectedEvents.length : 0,
+      dropped: Math.max(0, events.length - (deliveryArmed ? selectedEvents.length : 0)),
+      deliveryArmed: Boolean(deliveryArmed),
+      at: new Date().toISOString()
+    }
+  });
+  await updateBadge(history.length);
+
+  if (!deliveryArmed) {
+    return;
+  }
+
+  for (const event of selectedEvents) {
+    await emitAlert(event, settings);
+  }
+}
+
+async function areCodesProcessed(codes) {
+  const state = await chrome.storage.local.get({
+    processedCodes: []
+  });
+  const processedCodes = new Set(state.processedCodes);
+  const result = {};
+
+  for (const code of codes) {
+    const codeKey = String(code || '').toLowerCase();
+    result[codeKey] = processedCodes.has(codeKey);
+  }
+
+  return { ok: true, processed: result };
 }
 
 async function handleVideoFrames(payload, sender) {
   const settings = await loadSettings();
+  const { deliveryArmed } = await chrome.storage.local.get({
+    deliveryArmed: false
+  });
   const event = {
     messageId: payload?.messageId || null,
     messageUrl: payload?.messageUrl || null,
@@ -180,11 +341,11 @@ async function handleVideoFrames(payload, sender) {
     telegram: false
   };
 
-  if (settings.webhookEnabled && settings.webhookUrl) {
+  if (deliveryArmed && settings.webhookEnabled && settings.webhookUrl) {
     results.webhook = await sendFrameWebhook(settings.webhookUrl, event, settings);
   }
 
-  if (hasTelegramConfig(settings) && settings.telegramSendFrames) {
+  if (deliveryArmed && hasTelegramConfig(settings) && settings.telegramSendFrames) {
     try {
       results.telegram = await sendTelegramFrames(event, settings);
     } catch (error) {
@@ -438,6 +599,22 @@ function hasTelegramConfig(settings) {
   return Boolean(settings.telegramBotEnabled && settings.telegramBotToken && settings.telegramChatId);
 }
 
+function compareNewestEvents(left, right) {
+  const leftMessageNumber = Number(left.messageNumber);
+  const rightMessageNumber = Number(right.messageNumber);
+  if (Number.isFinite(leftMessageNumber) && Number.isFinite(rightMessageNumber) && leftMessageNumber !== rightMessageNumber) {
+    return rightMessageNumber - leftMessageNumber;
+  }
+
+  const leftTimelineMs = Number(left.timelineMs);
+  const rightTimelineMs = Number(right.timelineMs);
+  if (Number.isFinite(leftTimelineMs) && Number.isFinite(rightTimelineMs) && leftTimelineMs !== rightTimelineMs) {
+    return rightTimelineMs - leftTimelineMs;
+  }
+
+  return Date.parse(right.detectedAt || 0) - Date.parse(left.detectedAt || 0);
+}
+
 function buildTelegramApiUrl(token, method) {
   return `https://api.telegram.org/bot${String(token).trim()}/${method}`;
 }
@@ -497,6 +674,9 @@ async function getState() {
     settings: defaults,
     history: [],
     videoHistory: [],
+    deliveryArmed: false,
+    deliveryArmedAt: null,
+    monitorStatus: null,
     lastDetected: null,
     lastWebhookResult: null,
     lastFrameWebhookResult: null,
@@ -510,6 +690,9 @@ async function getState() {
     settings: { ...DEFAULT_SETTINGS, ...(state.settings || {}), ...defaults },
     history: state.history,
     videoHistory: state.videoHistory,
+    deliveryArmed: Boolean(state.deliveryArmed),
+    deliveryArmedAt: state.deliveryArmedAt,
+    monitorStatus: state.monitorStatus,
     lastDetected: state.lastDetected,
     lastWebhookResult: state.lastWebhookResult,
     lastFrameWebhookResult: state.lastFrameWebhookResult,
@@ -546,6 +729,8 @@ async function updateSettings(nextSettings) {
 
   settings.historyLimit = clampNumber(settings.historyLimit, 10, 2000);
   settings.processedLimit = clampNumber(settings.processedLimit, 100, 5000);
+  settings.maxLiveCodesPerBurst = clampNumber(settings.maxLiveCodesPerBurst, 1, 5);
+  settings.liveCodeBurstMs = clampNumber(settings.liveCodeBurstMs, 500, 10_000);
 
   await chrome.storage.local.set({ settings });
   return { ok: true, settings };
@@ -597,6 +782,10 @@ function sanitizeConfig(config) {
     'telegramChatId',
     'telegramSendCode',
     'telegramSendFrames',
+    'maxLiveCodesPerBurst',
+    'liveCodeBurstMs',
+    'autoDisarmOnScan',
+    'scanReadyNotification',
     'historyLimit',
     'processedLimit'
   ];

@@ -1,6 +1,7 @@
 'use strict';
 
 const elements = {
+  deliveryArmed: document.querySelector('#deliveryArmed'),
   notificationEnabled: document.querySelector('#notificationEnabled'),
   soundEnabled: document.querySelector('#soundEnabled'),
   webhookEnabled: document.querySelector('#webhookEnabled'),
@@ -11,6 +12,7 @@ const elements = {
   status: document.querySelector('#status'),
   history: document.querySelector('#history'),
   save: document.querySelector('#save'),
+  arm: document.querySelector('#arm'),
   scan: document.querySelector('#scan'),
   test: document.querySelector('#test'),
   clear: document.querySelector('#clear')
@@ -18,6 +20,7 @@ const elements = {
 
 document.addEventListener('DOMContentLoaded', refresh);
 elements.save.addEventListener('click', saveSettings);
+elements.arm.addEventListener('click', toggleArm);
 elements.scan.addEventListener('click', scanActiveTab);
 elements.test.addEventListener('click', testAlert);
 elements.clear.addEventListener('click', clearHistory);
@@ -29,7 +32,8 @@ async function refresh() {
     return;
   }
 
-  const { settings, history, lastWebhookResult } = response;
+  const { settings, history, lastWebhookResult, deliveryArmed, monitorStatus } = response;
+  elements.deliveryArmed.checked = Boolean(deliveryArmed);
   elements.notificationEnabled.checked = Boolean(settings.notificationEnabled);
   elements.soundEnabled.checked = Boolean(settings.soundEnabled);
   elements.webhookEnabled.checked = Boolean(settings.webhookEnabled);
@@ -37,13 +41,30 @@ async function refresh() {
   elements.webhookApiKey.value = settings.webhookApiKey || '';
   elements.webhookType.value = settings.webhookType || '';
   elements.count.textContent = String(history.length);
+  elements.arm.textContent = deliveryArmed ? 'Disarm' : 'Arm';
   renderHistory(history);
 
   if (lastWebhookResult?.ok === false) {
     setStatus(`Webhook failed: ${lastWebhookResult.error || lastWebhookResult.status}`);
+  } else if (monitorStatus?.status === 'scanning') {
+    setStatus('Scanning old codes...');
+  } else if (monitorStatus?.status === 'ready' && !deliveryArmed) {
+    setStatus('Scan ready. Arm endpoint.');
+  } else if (deliveryArmed) {
+    setStatus('Armed for next code');
   } else {
     setStatus('Ready');
   }
+}
+
+async function toggleArm() {
+  const response = await sendMessage({
+    type: 'TW_SET_DELIVERY_ARMED',
+    armed: !elements.deliveryArmed.checked
+  });
+
+  setStatus(response?.ok ? (response.deliveryArmed ? 'Endpoint armed' : 'Endpoint disarmed') : response?.error || 'Arm failed');
+  await refresh();
 }
 
 async function saveSettings() {

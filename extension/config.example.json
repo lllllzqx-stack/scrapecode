@@ -16,6 +16,10 @@
   "telegramChatId": "PUT_CHAT_ID_HERE",
   "telegramSendCode": true,
   "telegramSendFrames": true,
+  "maxLiveCodesPerBurst": 1,
+  "liveCodeBurstMs": 2500,
+  "autoDisarmOnScan": true,
+  "scanReadyNotification": true,
   "notificationEnabled": true,
   "soundEnabled": true
 }
