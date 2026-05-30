@@ -31,7 +31,7 @@ Contoh:
 ```json
 {
   "webhookEnabled": true,
-  "webhookUrl": "https://api.val.bot/api/webhooks/broadcast/content",
+  "webhookUrl": "",
   "webhookApiKey": "ISI_SENDIRI",
   "webhookType": "code_daily_hr",
   "videoCaptureEnabled": true,
